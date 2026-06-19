@@ -20,11 +20,27 @@ if (!process.env.JWT_SECRET) {
     console.error('CRITICAL ERROR: JWT_SECRET environment variable is missing.');
     process.exit(1);
 }
+const corsOrigin = (origin, callback) => {
+    if (!origin) {
+        callback(null, true);
+        return;
+    }
+    if (process.env.FRONTEND_URL) {
+        if (origin === process.env.FRONTEND_URL) {
+            callback(null, true);
+        }
+        else {
+            callback(null, false);
+        }
+        return;
+    }
+    callback(null, true);
+};
 const app = (0, express_1.default)();
 const server = http_1.default.createServer(app);
 const io = new socket_io_1.Server(server, {
     cors: {
-        origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+        origin: corsOrigin,
         methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
         credentials: true,
     },
@@ -33,7 +49,7 @@ const io = new socket_io_1.Server(server, {
 app.set('io', io);
 // Middleware
 app.use((0, cors_1.default)({
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    origin: corsOrigin,
     credentials: true,
 }));
 app.use(express_1.default.json());

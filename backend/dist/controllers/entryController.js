@@ -92,19 +92,11 @@ const getEntryByToken = async (req, res) => {
             queueId,
             status: 'called'
         }).sort({ calledAt: -1 });
-        const waitingCount = await QueueEntry_1.default.countDocuments({ queueId, status: 'waiting' });
-        const calledCount = await QueueEntry_1.default.countDocuments({ queueId, status: 'called' });
-        const servedCount = await QueueEntry_1.default.countDocuments({ queueId, status: 'served' });
         return res.json({
             entry,
             peopleAhead,
             currentServing: currentServingEntry ? currentServingEntry.token : 'None',
             averageServiceTime: entry.queueId.averageServiceTime,
-            queueStats: {
-                waiting: waitingCount,
-                called: calledCount,
-                served: servedCount
-            }
         });
     }
     catch (error) {
