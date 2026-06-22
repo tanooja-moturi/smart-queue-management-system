@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-import User from '../models/User';
+import { supabase } from '../config/db';
 
 export interface AuthRequest extends Request {
   user?: any;
@@ -17,11 +17,17 @@ export const protect = async (req: AuthRequest, res: Response, next: NextFunctio
       }
       const decoded: any = jwt.verify(token, process.env.JWT_SECRET);
 
-      req.user = await User.findById(decoded.id).select('-password');
-      if (!req.user) {
+      const { data: user, error } = await supabase
+        .from('users')
+        .select('_id, name, email, role, createdAt, updatedAt')
+        .eq('_id', decoded.id)
+        .single();
+
+      if (error || !user) {
         return res.status(401).json({ message: 'Not authorized, user not found' });
       }
 
+      req.user = user;
       return next();
     } catch (error) {
       console.error(error);

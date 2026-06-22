@@ -1,11 +1,7 @@
 "use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.deleteQueue = exports.getQueueByCode = exports.getQueues = exports.createQueue = void 0;
-const Queue_1 = __importDefault(require("../models/Queue"));
-const QueueEntry_1 = __importDefault(require("../models/QueueEntry"));
+const db_1 = require("../config/db");
 const createQueue = async (req, res) => {
     const { queueName, queueCode, averageServiceTime } = req.body;
     try {
@@ -13,7 +9,11 @@ const createQueue = async (req, res) => {
             return res.status(400).json({ message: 'All fields are required' });
         }
         const codeNormalized = queueCode.trim().toLowerCase().replace(/\s+/g, '-');
-        const queueExists = await Queue_1.default.findOne({ queueCode: codeNormalized });
+        const { data: queueExists } = await db_1.supabase
+            .from('queues')
+            .select('*')
+            .eq('queueCode', codeNormalized)
+            .maybeSingle();
         if (queueExists) {
             return res.status(400).json({ message: 'Queue with this code already exists' });
         }
@@ -22,13 +22,20 @@ const createQueue = async (req, res) => {
         if (!/^[A-Z]$/.test(prefix)) {
             prefix = 'A';
         }
-        const queue = await Queue_1.default.create({
+        const { data: queue, error } = await db_1.supabase
+            .from('queues')
+            .insert({
             queueName,
             queueCode: codeNormalized,
             averageServiceTime: Number(averageServiceTime),
             tokenPrefix: prefix,
             lastTokenNumber: 0,
-        });
+        })
+            .select()
+            .single();
+        if (error || !queue) {
+            return res.status(500).json({ message: error?.message || 'Error creating queue' });
+        }
         return res.status(201).json(queue);
     }
     catch (error) {
@@ -38,15 +45,36 @@ const createQueue = async (req, res) => {
 exports.createQueue = createQueue;
 const getQueues = async (req, res) => {
     try {
-        const queues = await Queue_1.default.find({}).sort({ createdAt: -1 });
+        const { data: queues, error } = await db_1.supabase
+            .from('queues')
+            .select('*')
+            .order('createdAt', { ascending: false });
+        if (error || !queues) {
+            return res.status(500).json({ message: error?.message || 'Error fetching queues' });
+        }
         const queuesWithStats = await Promise.all(queues.map(async (queue) => {
-            const waitingCount = await QueueEntry_1.default.countDocuments({ queueId: queue._id, status: 'waiting' });
-            const servedCount = await QueueEntry_1.default.countDocuments({ queueId: queue._id, status: 'served' });
-            const activeEntry = await QueueEntry_1.default.findOne({ queueId: queue._id, status: 'called' }).sort({ calledAt: -1 });
+            const { count: waitingCount } = await db_1.supabase
+                .from('queue_entries')
+                .select('*', { count: 'exact', head: true })
+                .eq('queueId', queue._id)
+                .eq('status', 'waiting');
+            const { count: servedCount } = await db_1.supabase
+                .from('queue_entries')
+                .select('*', { count: 'exact', head: true })
+                .eq('queueId', queue._id)
+                .eq('status', 'served');
+            const { data: activeEntry } = await db_1.supabase
+                .from('queue_entries')
+                .select('token')
+                .eq('queueId', queue._id)
+                .eq('status', 'called')
+                .order('calledAt', { ascending: false })
+                .limit(1)
+                .maybeSingle();
             return {
-                ...queue.toObject(),
-                waitingCount,
-                servedCount,
+                ...queue,
+                waitingCount: waitingCount || 0,
+                servedCount: servedCount || 0,
                 currentServing: activeEntry ? activeEntry.token : 'None',
             };
         }));
@@ -60,15 +88,30 @@ exports.getQueues = getQueues;
 const getQueueByCode = async (req, res) => {
     const { code } = req.params;
     try {
-        const queue = await Queue_1.default.findOne({ queueCode: code.toLowerCase() });
+        const { data: queue } = await db_1.supabase
+            .from('queues')
+            .select('*')
+            .eq('queueCode', code.toLowerCase())
+            .maybeSingle();
         if (!queue) {
             return res.status(404).json({ message: 'Queue not found' });
         }
-        const waitingCount = await QueueEntry_1.default.countDocuments({ queueId: queue._id, status: 'waiting' });
-        const currentServingEntry = await QueueEntry_1.default.findOne({ queueId: queue._id, status: 'called' }).sort({ calledAt: -1 });
+        const { count: waitingCount } = await db_1.supabase
+            .from('queue_entries')
+            .select('*', { count: 'exact', head: true })
+            .eq('queueId', queue._id)
+            .eq('status', 'waiting');
+        const { data: currentServingEntry } = await db_1.supabase
+            .from('queue_entries')
+            .select('token')
+            .eq('queueId', queue._id)
+            .eq('status', 'called')
+            .order('calledAt', { ascending: false })
+            .limit(1)
+            .maybeSingle();
         return res.json({
-            ...queue.toObject(),
-            waitingCount,
+            ...queue,
+            waitingCount: waitingCount || 0,
             currentServing: currentServingEntry ? currentServingEntry.token : 'None',
         });
     }
@@ -80,13 +123,17 @@ exports.getQueueByCode = getQueueByCode;
 const deleteQueue = async (req, res) => {
     const { id } = req.params;
     try {
-        const queue = await Queue_1.default.findById(id);
+        const { data: queue } = await db_1.supabase
+            .from('queues')
+            .select('*')
+            .eq('_id', id)
+            .maybeSingle();
         if (!queue) {
             return res.status(404).json({ message: 'Queue not found' });
         }
         // Cascade delete: delete the queue and all its associated entries
-        await Queue_1.default.findByIdAndDelete(id);
-        await QueueEntry_1.default.deleteMany({ queueId: id });
+        await db_1.supabase.from('queue_entries').delete().eq('queueId', id);
+        await db_1.supabase.from('queues').delete().eq('_id', id);
         // Broadcast a socket event to update clients if needed, or simply return success
         const io = req.app.get('io');
         if (io) {

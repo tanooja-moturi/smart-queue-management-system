@@ -5,7 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.protect = void 0;
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
-const User_1 = __importDefault(require("../models/User"));
+const db_1 = require("../config/db");
 const protect = async (req, res, next) => {
     let token;
     if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
@@ -15,10 +15,15 @@ const protect = async (req, res, next) => {
                 return res.status(500).json({ message: 'Internal server configuration error' });
             }
             const decoded = jsonwebtoken_1.default.verify(token, process.env.JWT_SECRET);
-            req.user = await User_1.default.findById(decoded.id).select('-password');
-            if (!req.user) {
+            const { data: user, error } = await db_1.supabase
+                .from('users')
+                .select('_id, name, email, role, createdAt, updatedAt')
+                .eq('_id', decoded.id)
+                .single();
+            if (error || !user) {
                 return res.status(401).json({ message: 'Not authorized, user not found' });
             }
+            req.user = user;
             return next();
         }
         catch (error) {

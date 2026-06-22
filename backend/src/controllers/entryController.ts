@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
-import mongoose from 'mongoose';
-import Queue from '../models/Queue';
-import QueueEntry from '../models/QueueEntry';
+import { supabase } from '../config/db';
+
+const isUUID = (str: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(str);
 
 export const joinQueue = async (req: Request, res: Response) => {
   const { code } = req.params;
@@ -13,46 +13,61 @@ export const joinQueue = async (req: Request, res: Response) => {
     }
 
     // 1. Find Queue
-    const queue = await Queue.findOne({ queueCode: code.toLowerCase() });
+    const { data: queue } = await supabase
+      .from('queues')
+      .select('*')
+      .eq('queueCode', code.toLowerCase())
+      .maybeSingle();
+
     if (!queue) {
       return res.status(404).json({ message: 'Queue not found' });
     }
 
     // Check if customer is already active in this queue (waiting or called)
     const trimmedName = customerName.trim();
-    const existingEntry = await QueueEntry.findOne({
-      queueId: queue._id,
-      customerName: { $regex: new RegExp(`^${trimmedName.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}$`, 'i') },
-      status: { $in: ['waiting', 'called'] }
-    });
+    // Escape %, _ for PostgreSQL ILIKE
+    const escapedName = trimmedName.replace(/[%_]/g, '\\$&');
+    const { data: existingEntry } = await supabase
+      .from('queue_entries')
+      .select('*')
+      .eq('queueId', queue._id)
+      .ilike('customerName', escapedName)
+      .in('status', ['waiting', 'called'])
+      .maybeSingle();
 
     if (existingEntry) {
       return res.status(200).json(existingEntry);
     }
 
-    // 2. Increment lastTokenNumber atomically and get updated queue
-    const updatedQueue = await Queue.findByIdAndUpdate(
-      queue._id,
-      { $inc: { lastTokenNumber: 1 } },
-      { new: true }
-    );
+    // 2. Increment lastTokenNumber atomically and get updated queue via RPC
+    const { data: updatedQueueArray, error: rpcError } = await supabase
+      .rpc('increment_queue_token', { queue_id: queue._id });
 
-    if (!updatedQueue) {
-      return res.status(500).json({ message: 'Error generating token' });
+    if (rpcError || !updatedQueueArray || updatedQueueArray.length === 0) {
+      return res.status(500).json({ message: rpcError?.message || 'Error generating token' });
     }
+    const updatedQueue = updatedQueueArray[0];
 
     // 3. Format Token (e.g. A001, B015)
     const paddedNum = String(updatedQueue.lastTokenNumber).padStart(3, '0');
     const token = `${updatedQueue.tokenPrefix}${paddedNum}`;
 
     // 4. Create Entry
-    const entry = await QueueEntry.create({
-      customerName: customerName.trim(),
-      queueId: queue._id,
-      token,
-      status: 'waiting',
-      joinedAt: new Date(),
-    });
+    const { data: entry, error: createError } = await supabase
+      .from('queue_entries')
+      .insert({
+        customerName: customerName.trim(),
+        queueId: queue._id,
+        token,
+        status: 'waiting',
+        joinedAt: new Date().toISOString(),
+      })
+      .select()
+      .single();
+
+    if (createError || !entry) {
+      return res.status(500).json({ message: createError?.message || 'Error creating queue entry' });
+    }
 
     // 5. Broadcast real-time update via socket
     const io = req.app.get('io');
@@ -71,46 +86,59 @@ export const getEntryByToken = async (req: Request, res: Response) => {
   const { queue } = req.query; // optional queue code or queueId to handle duplicate tokens
 
   try {
-    let query: any = { token: token.toUpperCase() };
+    let dbQuery = supabase
+      .from('queue_entries')
+      .select('*, queueId:queues(*)')
+      .eq('token', token.toUpperCase());
 
     if (queue) {
-      if (mongoose.Types.ObjectId.isValid(queue as string)) {
-        query.queueId = queue;
+      if (isUUID(queue as string)) {
+        dbQuery = dbQuery.eq('queueId', queue);
       } else {
-        const foundQueue = await Queue.findOne({ queueCode: (queue as string).toLowerCase() });
+        const { data: foundQueue } = await supabase
+          .from('queues')
+          .select('_id')
+          .eq('queueCode', (queue as string).toLowerCase())
+          .maybeSingle();
         if (foundQueue) {
-          query.queueId = foundQueue._id;
+          dbQuery = dbQuery.eq('queueId', foundQueue._id);
         }
       }
     }
 
     // Find the most recent entry with this token
-    const entry = await QueueEntry.findOne(query)
-      .populate('queueId')
-      .sort({ joinedAt: -1 });
+    const { data: entry } = await dbQuery
+      .order('joinedAt', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (!entry) {
       return res.status(404).json({ message: 'Queue entry not found' });
     }
 
-    const queueId = entry.queueId._id;
+    const queueId = (entry.queueId as any)._id;
 
     // People ahead: count waiting entries in the same queue that joined before this entry
-    const peopleAhead = await QueueEntry.countDocuments({
-      queueId,
-      status: 'waiting',
-      joinedAt: { $lt: entry.joinedAt }
-    });
+    const { count: peopleAhead } = await supabase
+      .from('queue_entries')
+      .select('*', { count: 'exact', head: true })
+      .eq('queueId', queueId)
+      .eq('status', 'waiting')
+      .lt('joinedAt', entry.joinedAt);
 
     // Currently serving: oldest with status 'called'
-    const currentServingEntry = await QueueEntry.findOne({
-      queueId,
-      status: 'called'
-    }).sort({ calledAt: -1 });
+    const { data: currentServingEntry } = await supabase
+      .from('queue_entries')
+      .select('token')
+      .eq('queueId', queueId)
+      .eq('status', 'called')
+      .order('calledAt', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     return res.json({
       entry,
-      peopleAhead,
+      peopleAhead: peopleAhead || 0,
       currentServing: currentServingEntry ? currentServingEntry.token : 'None',
       averageServiceTime: (entry.queueId as any).averageServiceTime,
     });
@@ -123,8 +151,15 @@ export const getQueueEntries = async (req: Request, res: Response) => {
   const { queueId } = req.params;
 
   try {
-    const entries = await QueueEntry.find({ queueId })
-      .sort({ joinedAt: 1 });
+    const { data: entries, error } = await supabase
+      .from('queue_entries')
+      .select('*')
+      .eq('queueId', queueId)
+      .order('joinedAt', { ascending: true });
+
+    if (error || !entries) {
+      return res.status(500).json({ message: error?.message || 'Error fetching entries' });
+    }
 
     return res.json(entries);
   } catch (error) {
@@ -141,18 +176,33 @@ export const updateEntryStatus = async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'Invalid status value' });
     }
 
-    const entry = await QueueEntry.findById(id);
-    if (!entry) {
+    const { data: entryExists } = await supabase
+      .from('queue_entries')
+      .select('*')
+      .eq('_id', id)
+      .maybeSingle();
+
+    if (!entryExists) {
       return res.status(404).json({ message: 'Queue entry not found' });
     }
 
-    entry.status = status;
+    const updateData: any = { status };
     if (status === 'called') {
-      entry.calledAt = new Date();
+      updateData.calledAt = new Date().toISOString();
     } else if (status === 'served') {
-      entry.servedAt = new Date();
+      updateData.servedAt = new Date().toISOString();
     }
-    await entry.save();
+
+    const { data: entry, error } = await supabase
+      .from('queue_entries')
+      .update(updateData)
+      .eq('_id', id)
+      .select()
+      .single();
+
+    if (error || !entry) {
+      return res.status(500).json({ message: error?.message || 'Error updating entry' });
+    }
 
     // Broadcast update
     const io = req.app.get('io');
@@ -179,13 +229,21 @@ export const callNext = async (req: Request, res: Response) => {
 
   try {
     // 1. Mark any currently 'called' customer as 'served'
-    await QueueEntry.updateMany(
-      { queueId, status: 'called' },
-      { status: 'served', servedAt: new Date() }
-    );
+    await supabase
+      .from('queue_entries')
+      .update({ status: 'served', servedAt: new Date().toISOString() })
+      .eq('queueId', queueId)
+      .eq('status', 'called');
 
     // 2. Find the oldest waiting customer for this queue
-    const nextEntry = await QueueEntry.findOne({ queueId, status: 'waiting' }).sort({ joinedAt: 1 });
+    const { data: nextEntry } = await supabase
+      .from('queue_entries')
+      .select('*')
+      .eq('queueId', queueId)
+      .eq('status', 'waiting')
+      .order('joinedAt', { ascending: true })
+      .limit(1)
+      .maybeSingle();
 
     const io = req.app.get('io');
 
@@ -198,21 +256,28 @@ export const callNext = async (req: Request, res: Response) => {
     }
 
     // 3. Mark next customer as called
-    nextEntry.status = 'called';
-    nextEntry.calledAt = new Date();
-    await nextEntry.save();
+    const { data: updatedEntry, error } = await supabase
+      .from('queue_entries')
+      .update({ status: 'called', calledAt: new Date().toISOString() })
+      .eq('_id', nextEntry._id)
+      .select()
+      .single();
+
+    if (error || !updatedEntry) {
+      return res.status(500).json({ message: error?.message || 'Error calling next customer' });
+    }
 
     // 4. Broadcast the update
     if (io) {
       io.to(queueId).emit('queue_updated', { queueId });
       io.emit('customer_called', {
         queueId,
-        token: nextEntry.token,
-        customerName: nextEntry.customerName,
+        token: updatedEntry.token,
+        customerName: updatedEntry.customerName,
       });
     }
 
-    return res.json(nextEntry);
+    return res.json(updatedEntry);
   } catch (error) {
     return res.status(500).json({ message: (error as Error).message });
   }

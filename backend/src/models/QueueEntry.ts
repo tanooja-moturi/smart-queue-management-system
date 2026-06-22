@@ -1,21 +1,16 @@
-import mongoose from 'mongoose';
+import { IQueue } from './Queue';
 
-const queueEntrySchema = new mongoose.Schema(
-  {
-    customerName: { type: String, required: true },
-    queueId: { type: mongoose.Schema.Types.ObjectId, ref: 'Queue', required: true },
-    token: { type: String, required: true },
-    status: {
-      type: String,
-      enum: ['waiting', 'called', 'served', 'skipped'],
-      default: 'waiting',
-    },
-    joinedAt: { type: Date, default: Date.now },
-    calledAt: { type: Date },
-    servedAt: { type: Date },
-  },
-  { timestamps: true }
-);
+export interface IQueueEntry {
+  _id: string;
+  customerName: string;
+  queueId: string | IQueue;
+  token: string;
+  status: 'waiting' | 'called' | 'served' | 'skipped';
+  joinedAt?: string;
+  calledAt?: string;
+  servedAt?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
 
-export const QueueEntry = mongoose.model('QueueEntry', queueEntrySchema);
-export default QueueEntry;
+export default IQueueEntry;

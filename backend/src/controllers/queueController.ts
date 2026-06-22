@@ -1,6 +1,5 @@
 import { Request, Response } from 'express';
-import Queue from '../models/Queue';
-import QueueEntry from '../models/QueueEntry';
+import { supabase } from '../config/db';
 
 export const createQueue = async (req: Request, res: Response) => {
   const { queueName, queueCode, averageServiceTime } = req.body;
@@ -11,7 +10,12 @@ export const createQueue = async (req: Request, res: Response) => {
     }
 
     const codeNormalized = queueCode.trim().toLowerCase().replace(/\s+/g, '-');
-    const queueExists = await Queue.findOne({ queueCode: codeNormalized });
+    
+    const { data: queueExists } = await supabase
+      .from('queues')
+      .select('*')
+      .eq('queueCode', codeNormalized)
+      .maybeSingle();
 
     if (queueExists) {
       return res.status(400).json({ message: 'Queue with this code already exists' });
@@ -23,13 +27,21 @@ export const createQueue = async (req: Request, res: Response) => {
       prefix = 'A';
     }
 
-    const queue = await Queue.create({
-      queueName,
-      queueCode: codeNormalized,
-      averageServiceTime: Number(averageServiceTime),
-      tokenPrefix: prefix,
-      lastTokenNumber: 0,
-    });
+    const { data: queue, error } = await supabase
+      .from('queues')
+      .insert({
+        queueName,
+        queueCode: codeNormalized,
+        averageServiceTime: Number(averageServiceTime),
+        tokenPrefix: prefix,
+        lastTokenNumber: 0,
+      })
+      .select()
+      .single();
+
+    if (error || !queue) {
+      return res.status(500).json({ message: error?.message || 'Error creating queue' });
+    }
 
     return res.status(201).json(queue);
   } catch (error) {
@@ -39,18 +51,42 @@ export const createQueue = async (req: Request, res: Response) => {
 
 export const getQueues = async (req: Request, res: Response) => {
   try {
-    const queues = await Queue.find({}).sort({ createdAt: -1 });
+    const { data: queues, error } = await supabase
+      .from('queues')
+      .select('*')
+      .order('createdAt', { ascending: false });
+
+    if (error || !queues) {
+      return res.status(500).json({ message: error?.message || 'Error fetching queues' });
+    }
 
     const queuesWithStats = await Promise.all(
       queues.map(async (queue) => {
-        const waitingCount = await QueueEntry.countDocuments({ queueId: queue._id, status: 'waiting' });
-        const servedCount = await QueueEntry.countDocuments({ queueId: queue._id, status: 'served' });
-        const activeEntry = await QueueEntry.findOne({ queueId: queue._id, status: 'called' }).sort({ calledAt: -1 });
+        const { count: waitingCount } = await supabase
+          .from('queue_entries')
+          .select('*', { count: 'exact', head: true })
+          .eq('queueId', queue._id)
+          .eq('status', 'waiting');
+
+        const { count: servedCount } = await supabase
+          .from('queue_entries')
+          .select('*', { count: 'exact', head: true })
+          .eq('queueId', queue._id)
+          .eq('status', 'served');
+
+        const { data: activeEntry } = await supabase
+          .from('queue_entries')
+          .select('token')
+          .eq('queueId', queue._id)
+          .eq('status', 'called')
+          .order('calledAt', { ascending: false })
+          .limit(1)
+          .maybeSingle();
 
         return {
-          ...queue.toObject(),
-          waitingCount,
-          servedCount,
+          ...queue,
+          waitingCount: waitingCount || 0,
+          servedCount: servedCount || 0,
           currentServing: activeEntry ? activeEntry.token : 'None',
         };
       })
@@ -66,18 +102,34 @@ export const getQueueByCode = async (req: Request, res: Response) => {
   const { code } = req.params;
 
   try {
-    const queue = await Queue.findOne({ queueCode: code.toLowerCase() });
+    const { data: queue } = await supabase
+      .from('queues')
+      .select('*')
+      .eq('queueCode', code.toLowerCase())
+      .maybeSingle();
 
     if (!queue) {
       return res.status(404).json({ message: 'Queue not found' });
     }
 
-    const waitingCount = await QueueEntry.countDocuments({ queueId: queue._id, status: 'waiting' });
-    const currentServingEntry = await QueueEntry.findOne({ queueId: queue._id, status: 'called' }).sort({ calledAt: -1 });
+    const { count: waitingCount } = await supabase
+      .from('queue_entries')
+      .select('*', { count: 'exact', head: true })
+      .eq('queueId', queue._id)
+      .eq('status', 'waiting');
+
+    const { data: currentServingEntry } = await supabase
+      .from('queue_entries')
+      .select('token')
+      .eq('queueId', queue._id)
+      .eq('status', 'called')
+      .order('calledAt', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     return res.json({
-      ...queue.toObject(),
-      waitingCount,
+      ...queue,
+      waitingCount: waitingCount || 0,
       currentServing: currentServingEntry ? currentServingEntry.token : 'None',
     });
   } catch (error) {
@@ -89,15 +141,19 @@ export const deleteQueue = async (req: Request, res: Response) => {
   const { id } = req.params;
 
   try {
-    const queue = await Queue.findById(id);
+    const { data: queue } = await supabase
+      .from('queues')
+      .select('*')
+      .eq('_id', id)
+      .maybeSingle();
 
     if (!queue) {
       return res.status(404).json({ message: 'Queue not found' });
     }
 
     // Cascade delete: delete the queue and all its associated entries
-    await Queue.findByIdAndDelete(id);
-    await QueueEntry.deleteMany({ queueId: id });
+    await supabase.from('queue_entries').delete().eq('queueId', id);
+    await supabase.from('queues').delete().eq('_id', id);
 
     // Broadcast a socket event to update clients if needed, or simply return success
     const io = req.app.get('io');

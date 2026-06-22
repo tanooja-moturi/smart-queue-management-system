@@ -10,7 +10,6 @@ const cors_1 = __importDefault(require("cors"));
 const dotenv_1 = __importDefault(require("dotenv"));
 const bcryptjs_1 = __importDefault(require("bcryptjs"));
 const db_1 = require("./config/db");
-const User_1 = __importDefault(require("./models/User"));
 const authRoutes_1 = __importDefault(require("./routes/authRoutes"));
 const queueRoutes_1 = __importDefault(require("./routes/queueRoutes"));
 const entryRoutes_1 = __importDefault(require("./routes/entryRoutes"));
@@ -58,17 +57,29 @@ app.use(express_1.default.urlencoded({ extended: true }));
 (0, db_1.connectDB)().then(async () => {
     // Seed default staff account if none exists
     try {
-        const staffCount = await User_1.default.countDocuments({ role: 'staff' });
-        if (staffCount === 0) {
+        const { count, error } = await db_1.supabase
+            .from('users')
+            .select('*', { count: 'exact', head: true })
+            .eq('role', 'staff');
+        if (error) {
+            console.error('Error querying staff user count:', error);
+            return;
+        }
+        if (count === 0) {
             const salt = await bcryptjs_1.default.genSalt(10);
             const hashedPassword = await bcryptjs_1.default.hash('password123', salt);
-            await User_1.default.create({
+            const { error: insertError } = await db_1.supabase.from('users').insert({
                 name: 'Default Staff',
                 email: 'staff@queue.com',
                 password: hashedPassword,
                 role: 'staff',
             });
-            console.log('Seeded default staff user: staff@queue.com / password123');
+            if (insertError) {
+                console.error('Error seeding default user:', insertError);
+            }
+            else {
+                console.log('Seeded default staff user: staff@queue.com / password123');
+            }
         }
     }
     catch (error) {
