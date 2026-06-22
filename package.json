@@ -8,6 +8,7 @@
     "dev:frontend": "cd frontend && npm run dev"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.108.2",
     "concurrently": "^8.2.2"
   }
 }
