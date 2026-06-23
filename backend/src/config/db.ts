@@ -5,7 +5,10 @@ export { supabase };
 export const connectDB = async () => {
   try {
     // Simple query to verify connection to the tables
-    const { error } = await supabase.from('users').select('count', { count: 'exact', head: true });
+    const { error } = await supabase
+      .from('users')
+      .select('*')
+      .limit(1);
     
     if (error) {
       // Check if table missing error (PGRST205)
