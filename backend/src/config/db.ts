@@ -16,7 +16,10 @@ export const connectDB = async () => {
     }
     console.log('Supabase Connected Successfully');
   } catch (error) {
-    console.error(`Error connecting to Supabase: ${(error as Error).message}`);
+    console.error('========================');
+    console.error('FULL SUPABASE ERROR');
+    console.error(error);
+    console.error('========================');
     process.exit(1);
   }
 };
